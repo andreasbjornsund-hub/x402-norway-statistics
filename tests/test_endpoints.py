@@ -17,7 +17,31 @@ def _exchange_payload(rates):
     }
 
 
-def _ssb_simple_series(times, values, time_dim="Tid"):
+def _ssb_simple_series(times, values, time_dim="Tid", content_code=None):
+    """Fake JSON-stat dataset.
+
+    If `content_code` is given, adds a single-value ContentsCode dimension so
+    handlers that filter by ContentsCode see the values. The handler-side
+    filters were added after the production /cpi bug where SSB returned 4
+    parallel series and the weight series (=1000) leaked into `current_index`.
+    """
+    if content_code:
+        return {
+            "version": "2.0", "class": "dataset",
+            "id": ["ContentsCode", time_dim],
+            "size": [1, len(times)],
+            "value": values,
+            "dimension": {
+                "ContentsCode": {"category": {
+                    "index": {content_code: 0},
+                    "label": {content_code: content_code},
+                }},
+                time_dim: {"category": {
+                    "index": {t: i for i, t in enumerate(times)},
+                    "label": {t: t for t in times},
+                }},
+            },
+        }
     return {
         "version": "2.0", "class": "dataset",
         "id": [time_dim], "size": [len(times)], "value": values,
@@ -168,7 +192,7 @@ async def test_population_unknown_municipality(main_module):
 async def test_cpi_happy_path(main_module, fake_http):
     months = [f"2025M{m:02d}" for m in range(1, 13)] + [f"2026M{m:02d}" for m in range(1, 5)]
     values = [130 + i * 0.3 for i in range(len(months))]
-    fake_http.stub_post("/table/03013", 200, _ssb_simple_series(months, values))
+    fake_http.stub_post("/table/03013", 200, _ssb_simple_series(months, values, content_code="KpiIndMnd"))
     out = await main_module.cpi(response=Response(), months=12)
     assert out["month"] == months[-1]
     assert out["current_index"] == values[-1]
@@ -179,7 +203,7 @@ async def test_cpi_happy_path(main_module, fake_http):
 async def test_housing_returns_quarterly(main_module, fake_http):
     quarters = [f"2024K{q}" for q in range(1, 5)] + [f"2025K{q}" for q in range(1, 5)]
     values = [300 + i for i in range(len(quarters))]
-    fake_http.stub_post("/table/07241", 200, _ssb_simple_series(quarters, values))
+    fake_http.stub_post("/table/07241", 200, _ssb_simple_series(quarters, values, content_code="KvPris"))
     out = await main_module.housing(response=Response(), quarters=4)
     assert out["price_index"] == values[-1]
     assert len(out["quarterly"]) == 4
@@ -188,7 +212,7 @@ async def test_housing_returns_quarterly(main_module, fake_http):
 async def test_unemployment_handler(main_module, fake_http):
     months = [f"2026M{m:02d}" for m in range(1, 5)]
     values = [3.7, 3.8, 3.8, 3.9]
-    fake_http.stub_post("/table/08517", 200, _ssb_simple_series(months, values))
+    fake_http.stub_post("/table/08517", 200, _ssb_simple_series(months, values, content_code="Prosent"))
     out = await main_module.unemployment(response=Response(), months=4)
     assert out["rate_pct"] == 3.9
 
@@ -196,6 +220,6 @@ async def test_unemployment_handler(main_module, fake_http):
 async def test_gdp_handler(main_module, fake_http):
     quarters = [f"2025K{q}" for q in range(1, 5)] + [f"2026K{q}" for q in range(1, 3)]
     values = [1_000_000 + i * 5_000 for i in range(len(quarters))]
-    fake_http.stub_post("/table/09190", 200, _ssb_simple_series(quarters, values))
+    fake_http.stub_post("/table/09190", 200, _ssb_simple_series(quarters, values, content_code="Faste"))
     out = await main_module.gdp(response=Response(), quarters=4)
     assert out["gdp_value"] == values[-1]
