@@ -551,12 +551,15 @@ async def cpi(
     response: Response,
     months: int = Query(12, ge=1, le=120),
 ):
-    body = ssb.build_query({"Tid": ["*"]})
+    # KpiIndMnd = monthly index. Without this constraint SSB returns 4 series
+    # (index, m/m change, y/y change, weight) — the weight series is always
+    # 1000, which would silently land in `last["value"]`.
+    body = ssb.build_query({"ContentsCode": ["KpiIndMnd"], "Tid": ["*"]})
     try:
         data, hit = await ssb.query(_http, ssb.TABLE_CPI, body, ttl=TTL_SSB)
     except ssb.SSBError as e:
         raise HTTPException(503, f"SSB upstream: {e.message}")
-    rows = jsonstat.time_series(data, time_dim="Tid")
+    rows = jsonstat.time_series(data, time_dim="Tid", value_filter={"ContentsCode": "KpiIndMnd"})
     if not rows:
         raise HTTPException(503, "No CPI data returned")
     series = rows[-months:]
@@ -573,12 +576,14 @@ async def housing(
     response: Response,
     quarters: int = Query(8, ge=1, le=40),
 ):
-    body = ssb.build_query({"Tid": ["*"]})
+    # KvPris = price per square metre. The other content (Omsetninger /
+    # transaction count) would otherwise leak into `last["value"]`.
+    body = ssb.build_query({"ContentsCode": ["KvPris"], "Tid": ["*"]})
     try:
         data, hit = await ssb.query(_http, ssb.TABLE_HOUSING, body, ttl=TTL_SSB)
     except ssb.SSBError as e:
         raise HTTPException(503, f"SSB upstream: {e.message}")
-    rows = jsonstat.time_series(data, time_dim="Tid")
+    rows = jsonstat.time_series(data, time_dim="Tid", value_filter={"ContentsCode": "KvPris"})
     if not rows:
         raise HTTPException(503, "No housing data returned")
     series = rows[-quarters:]
@@ -595,12 +600,14 @@ async def unemployment(
     response: Response,
     months: int = Query(12, ge=1, le=60),
 ):
-    body = ssb.build_query({"Tid": ["*"]})
+    # Prosent = unemployment rate (per cent). The other content (Personer /
+    # absolute count) would otherwise leak into `last["value"]`.
+    body = ssb.build_query({"ContentsCode": ["Prosent"], "Tid": ["*"]})
     try:
         data, hit = await ssb.query(_http, ssb.TABLE_UNEMPLOYMENT, body, ttl=TTL_SSB)
     except ssb.SSBError as e:
         raise HTTPException(503, f"SSB upstream: {e.message}")
-    rows = jsonstat.time_series(data, time_dim="Tid")
+    rows = jsonstat.time_series(data, time_dim="Tid", value_filter={"ContentsCode": "Prosent"})
     if not rows:
         raise HTTPException(503, "No unemployment data returned")
     series = rows[-months:]
@@ -615,12 +622,19 @@ async def gdp(
     response: Response,
     quarters: int = Query(8, ge=1, le=40),
 ):
-    body = ssb.build_query({"Tid": ["*"]})
+    # Table 09190 has 3 dimensions. SSB rejects an unconstrained query
+    # (returned 502 to clients), so pin Makrost to total GDP at market values
+    # (bnpb.nr23_9) and ContentsCode to Faste (constant 2023-prices).
+    body = ssb.build_query({
+        "Makrost": ["bnpb.nr23_9"],
+        "ContentsCode": ["Faste"],
+        "Tid": ["*"],
+    })
     try:
         data, hit = await ssb.query(_http, ssb.TABLE_GDP, body, ttl=TTL_SSB)
     except ssb.SSBError as e:
         raise HTTPException(503, f"SSB upstream: {e.message}")
-    rows = jsonstat.time_series(data, time_dim="Tid")
+    rows = jsonstat.time_series(data, time_dim="Tid", value_filter={"ContentsCode": "Faste"})
     if not rows:
         raise HTTPException(503, "No GDP data returned")
     series = rows[-quarters:]
