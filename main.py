@@ -1,28 +1,49 @@
 """
-x402 Agent — REPLACE THIS DESCRIPTION
+x402-norway-statistics — Norwegian Statistics & Economics
+
+x402 micropayment API combining SSB (Statistics Norway) and Norges Bank
+data into a single agent-friendly service.
 
 Endpoints (free):
-  GET /                   — landing page (HTML or JSON)
-  GET /health             — health check
-  GET /api-status         — uptime + cache shape (operational visibility)
-  GET /services.json      — agent-readable services manifest
-  GET /llms.txt           — LLMs.txt for AI crawlers
-  GET /robots.txt         — robots policy
-  GET /.well-known/x402.json — x402 agent-discovery manifest
+  GET /                       — landing page (HTML or JSON)
+  GET /health                 — health check
+  GET /api-status             — uptime + cache shape
+  GET /currencies             — list supported currencies
+  GET /municipalities         — list ~50 Norwegian municipalities + codes
+  GET /services.json          — agent-readable services manifest
+  GET /llms.txt               — LLMs.txt for AI crawlers
+  GET /robots.txt             — robots policy
+  GET /.well-known/x402.json  — x402 agent-discovery manifest
 
-Endpoints (paid — REPLACE):
-  GET /example             — $0.01: replace with your paid endpoint
+Endpoints (paid, USDC on Base):
+  GET /exchange               $0.005   USD/NOK rate + history
+  GET /exchange/convert       $0.005   amount conversion at latest rate
+  GET /policy-rate            $0.005   Norges Bank key policy rate
+  GET /population             $0.01    SSB municipality population
+  GET /cpi                    $0.01    SSB consumer price index
+  GET /housing                $0.01    SSB house-price index
+  GET /unemployment           $0.01    SSB unemployment
+  GET /gdp                    $0.01    SSB quarterly national accounts
+
+Data: Statistics Norway (data.ssb.no) and Norges Bank (data.norges-bank.no).
+Both free, no API keys. SSB cached 24 h, exchange rates 1 h, policy rate 6 h.
 """
-
 import os
 import time
 from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+
+import cache
+import currencies
+import jsonstat
+import municipalities
+import norges_bank_client as nb
+import ssb_client as ssb
 
 from cdp_auth import create_cdp_auth_provider
 
@@ -37,23 +58,23 @@ load_dotenv()
 
 # ── Config ──────────────────────────────────────────────────────────
 
-# Override these for each agent. Defaults match the shared payTo wallet.
-SERVICE_ID = os.getenv("SERVICE_ID", "x402-agent-template")
-SERVICE_NAME = os.getenv("SERVICE_NAME", "x402 Agent Template")
-SERVICE_DESCRIPTION = os.getenv(
-    "SERVICE_DESCRIPTION",
-    "REPLACE: short description of what this agent does. Pay per query with USDC via x402.",
+SERVICE_ID = "norway-statistics"
+SERVICE_NAME = "Norwegian Statistics & Economics"
+SERVICE_DESCRIPTION = (
+    "Exchange rates, population, housing prices, CPI, GDP — all from official "
+    "Norwegian sources (SSB and Norges Bank). Pay per query with USDC via x402."
 )
-SERVICE_CATEGORY = os.getenv("SERVICE_CATEGORY", "data")
+SERVICE_CATEGORY = "data"
 
 EVM_ADDRESS = os.getenv("EVM_ADDRESS")
-EVM_NETWORK: Network = "eip155:8453"  # Base mainnet
+EVM_NETWORK: Network = "eip155:8453"
 FACILITATOR_URL = os.getenv("FACILITATOR_URL", "https://x402.org/facilitator")
-SITE_URL = os.getenv("SITE_URL", f"https://{SERVICE_ID}.fly.dev")
-
-# USDC contract on Base mainnet — embedded in agent-discovery manifests so
-# payers can sign EIP-3009 transferWithAuthorization without an extra lookup.
+SITE_URL = os.getenv("SITE_URL", "https://x402-norway-statistics.fly.dev")
 USDC_BASE_MAINNET = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+TTL_RATES = int(os.getenv("TTL_RATES", str(60 * 60)))
+TTL_POLICY = int(os.getenv("TTL_POLICY", str(6 * 60 * 60)))
+TTL_SSB = int(os.getenv("TTL_SSB", str(24 * 60 * 60)))
 
 if not EVM_ADDRESS:
     raise ValueError("Set EVM_ADDRESS in .env")
@@ -77,8 +98,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── x402 payment middleware ─────────────────────────────────────────
-
 import json as _json
 
 cdp_auth = None
@@ -86,10 +105,6 @@ if "cdp.coinbase.com" in FACILITATOR_URL:
     cdp_auth = create_cdp_auth_provider()
 facilitator_config = FacilitatorConfig(url=FACILITATOR_URL, auth_provider=cdp_auth)
 facilitator = HTTPFacilitatorClient(facilitator_config)
-
-# ── V2→V1 conversion shim for CDP facilitator ──────────────────────
-# CDP only supports x402 v1; the SDK speaks v2. This shim translates
-# in both directions. Keep verbatim — modifying it breaks payments.
 
 _CAIP2_TO_V1 = {"eip155:8453": "base", "eip155:84532": "base-sepolia"}
 
@@ -135,15 +150,11 @@ _orig_settle = facilitator._settle_http
 
 
 async def _v1_verify(version, payload_dict, requirements_dict):
-    v1_payload = _v2_payload_to_v1(payload_dict)
-    v1_reqs = _v2_requirements_to_v1(requirements_dict)
-    return await _orig_verify(1, v1_payload, v1_reqs)
+    return await _orig_verify(1, _v2_payload_to_v1(payload_dict), _v2_requirements_to_v1(requirements_dict))
 
 
 async def _v1_settle(version, payload_dict, requirements_dict):
-    v1_payload = _v2_payload_to_v1(payload_dict)
-    v1_reqs = _v2_requirements_to_v1(requirements_dict)
-    return await _orig_settle(1, v1_payload, v1_reqs)
+    return await _orig_settle(1, _v2_payload_to_v1(payload_dict), _v2_requirements_to_v1(requirements_dict))
 
 
 facilitator._verify_http = _v1_verify
@@ -153,47 +164,108 @@ server = x402ResourceServer(facilitator)
 server.register(EVM_NETWORK, ExactEvmServerScheme())
 
 # ── Endpoint catalog ────────────────────────────────────────────────
-# Single source of truth. Drives x402 middleware routes, /services.json,
-# /llms.txt, /.well-known/x402.json, and the root JSON response. Add a
-# new entry here + one handler below = new endpoint everywhere.
-
 
 ENDPOINT_CATALOG: list[dict] = [
-    # ── REPLACE: paid endpoints ──
     {
         "method": "GET",
-        "path": "/example",
-        "route_pattern": "GET /example",
-        "description": "REPLACE: short description of this paid endpoint.",
+        "path": "/exchange/convert",
+        "route_pattern": "GET /exchange/convert",
+        "description": "Convert an amount between two currencies using the latest Norges Bank rates.",
+        "price_usd": "$0.005",
+        "amount_atomic": "5000",
+        "query_params": {"amount": 100, "from": "USD", "to": "NOK"},
+        "path_params": {},
+        "output_example": {"amount": 100, "from": "USD", "to": "NOK", "rate": 10.45, "result": 1045.00, "date": "2026-05-08"},
+    },
+    {
+        "method": "GET",
+        "path": "/exchange",
+        "route_pattern": "GET /exchange",
+        "description": "Current and historical CURRENCY/NOK exchange rates from Norges Bank. Optional ?days= for a longer history.",
+        "price_usd": "$0.005",
+        "amount_atomic": "5000",
+        "query_params": {"from": "USD", "days": 30},
+        "path_params": {},
+        "output_example": {"pair": "USD/NOK", "rate": 10.45, "date": "2026-05-08", "history": [{"date": "2026-05-07", "rate": 10.42}]},
+    },
+    {
+        "method": "GET",
+        "path": "/policy-rate",
+        "route_pattern": "GET /policy-rate",
+        "description": "Norges Bank key policy rate (KPRA) — current value plus recent history.",
+        "price_usd": "$0.005",
+        "amount_atomic": "5000",
+        "query_params": {"days": 365},
+        "path_params": {},
+        "output_example": {"current_rate": 4.50, "effective_date": "2024-12-19", "history": [{"date": "2024-12-19", "rate": 4.50}]},
+    },
+    {
+        "method": "GET",
+        "path": "/population",
+        "route_pattern": "GET /population",
+        "description": "Population for a Norwegian municipality (by name or 4-digit code) from SSB table 07459.",
         "price_usd": "$0.01",
-        "amount_atomic": "10000",  # USDC has 6 decimals; $0.01 = 10000 microUSDC
-        "query_params": {"q": "example"},
+        "amount_atomic": "10000",
+        "query_params": {"municipality": "oslo"},
         "path_params": {},
-        "output_example": {"result": "replace me"},
-    },
-    # ── Free endpoints (don't remove /health) ──
-    {
-        "method": "GET",
-        "path": "/health",
-        "route_pattern": None,
-        "description": "Service health check.",
-        "price_usd": None,
-        "amount_atomic": None,
-        "query_params": {},
-        "path_params": {},
-        "output_example": {"status": "ok"},
+        "output_example": {"municipality": "Oslo", "code": "0301", "population": 709037, "year": "2025", "history": [{"year": "2024", "population": 700637}]},
     },
     {
         "method": "GET",
-        "path": "/api-status",
-        "route_pattern": None,
-        "description": "Operational status — uptime and cache shape.",
-        "price_usd": None,
-        "amount_atomic": None,
-        "query_params": {},
+        "path": "/cpi",
+        "route_pattern": "GET /cpi",
+        "description": "Consumer Price Index (KPI) total — current index, year-over-year inflation, monthly history.",
+        "price_usd": "$0.01",
+        "amount_atomic": "10000",
+        "query_params": {"months": 12},
         "path_params": {},
-        "output_example": None,
+        "output_example": {"current_index": 134.2, "month": "2026M04", "inflation_yoy_pct": 3.1, "monthly": [{"month": "2026M04", "index": 134.2}]},
     },
+    {
+        "method": "GET",
+        "path": "/housing",
+        "route_pattern": "GET /housing",
+        "description": "House-price index from SSB table 07241. Quarterly.",
+        "price_usd": "$0.01",
+        "amount_atomic": "10000",
+        "query_params": {"quarters": 8},
+        "path_params": {},
+        "output_example": {"region": "Hele landet", "price_index": 312.4, "change_yoy_pct": 2.8, "quarterly": [{"quarter": "2026K1", "index": 312.4}]},
+    },
+    {
+        "method": "GET",
+        "path": "/unemployment",
+        "route_pattern": "GET /unemployment",
+        "description": "Registered unemployment from SSB table 08517. Monthly.",
+        "price_usd": "$0.01",
+        "amount_atomic": "10000",
+        "query_params": {"months": 12},
+        "path_params": {},
+        "output_example": {"region": "Hele landet", "rate_pct": 3.8, "month": "2026M04", "monthly": [{"month": "2026M04", "rate_pct": 3.8}]},
+    },
+    {
+        "method": "GET",
+        "path": "/gdp",
+        "route_pattern": "GET /gdp",
+        "description": "Quarterly GDP from SSB national accounts table 09190.",
+        "price_usd": "$0.01",
+        "amount_atomic": "10000",
+        "query_params": {"quarters": 8},
+        "path_params": {},
+        "output_example": {"gdp_value": 1050000, "quarter": "2026K1", "growth_yoy_pct": 1.4, "quarterly": [{"quarter": "2026K1", "value": 1050000}]},
+    },
+    {"method": "GET", "path": "/currencies", "route_pattern": None,
+     "description": "List of supported currencies (free).", "price_usd": None, "amount_atomic": None,
+     "query_params": {}, "path_params": {}, "output_example": None},
+    {"method": "GET", "path": "/municipalities", "route_pattern": None,
+     "description": "List of supported Norwegian municipalities and 4-digit codes (free).",
+     "price_usd": None, "amount_atomic": None, "query_params": {}, "path_params": {}, "output_example": None},
+    {"method": "GET", "path": "/health", "route_pattern": None,
+     "description": "Service health check.", "price_usd": None, "amount_atomic": None,
+     "query_params": {}, "path_params": {}, "output_example": {"status": "ok"}},
+    {"method": "GET", "path": "/api-status", "route_pattern": None,
+     "description": "Operational status — uptime and upstream-cache shape.",
+     "price_usd": None, "amount_atomic": None, "query_params": {}, "path_params": {}, "output_example": None},
 ]
 
 
@@ -204,67 +276,50 @@ def _bazaar_info(entry: dict) -> dict:
     if entry["path_params"]:
         inp["pathParams"] = entry["path_params"]
     return {
-        "info": {
-            "input": inp,
-            "output": {"type": "json", "example": entry["output_example"]},
-        },
-        "schema": {
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "object",
-            "properties": {"input": {"type": "object"}, "output": {"type": "object"}},
-        },
+        "info": {"input": inp, "output": {"type": "json", "example": entry["output_example"]}},
+        "schema": {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                   "type": "object",
+                   "properties": {"input": {"type": "object"}, "output": {"type": "object"}}},
     }
 
 
 def _build_paid_routes(catalog: list[dict]) -> dict[str, RouteConfig]:
     return {
         e["route_pattern"]: RouteConfig(
-            accepts=[
-                PaymentOption(
-                    scheme="exact",
-                    pay_to=EVM_ADDRESS,
-                    price=e["price_usd"],
-                    network=EVM_NETWORK,
-                ),
-            ],
+            accepts=[PaymentOption(scheme="exact", pay_to=EVM_ADDRESS, price=e["price_usd"], network=EVM_NETWORK)],
             mime_type="application/json",
             description=e["description"],
             extensions={"bazaar": _bazaar_info(e)},
         )
-        for e in catalog
-        if e["route_pattern"] is not None
+        for e in catalog if e["route_pattern"] is not None
     }
 
 
 routes = _build_paid_routes(ENDPOINT_CATALOG)
 app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
 
-# ── HTTP client (reuse for upstream API calls) ──────────────────────
+# ── Shared HTTP client ──────────────────────────────────────────────
 
 _http = httpx.AsyncClient(timeout=30, headers={"Accept": "application/json"})
-
-# ── Discovery / metadata endpoints ──────────────────────────────────
 
 _PROCESS_START_TS = time.time()
 
 
+# ── Discovery / metadata endpoints ──────────────────────────────────
+
+
 @app.get("/")
 async def landing(request: Request):
-    """Content-negotiate: HTML for browsers, JSON for API clients."""
     accept = request.headers.get("accept", "")
     if "text/html" in accept and os.path.isfile("static/index.html"):
         return FileResponse("static/index.html")
     return {
-        "service": SERVICE_NAME,
-        "version": "0.1.0",
-        "description": SERVICE_DESCRIPTION,
-        "endpoints": {
-            e["path"]: f"{e['description']} ({e['price_usd']} USDC)" if e["price_usd"]
-            else f"{e['description']} (free)"
-            for e in ENDPOINT_CATALOG
-        }
-        | {"/.well-known/x402.json": "Agent discovery"},
+        "service": SERVICE_NAME, "version": "0.1.0", "description": SERVICE_DESCRIPTION,
+        "endpoints": {e["path"]: f"{e['description']} ({e['price_usd']} USDC)" if e["price_usd"]
+                      else f"{e['description']} (free)"
+                      for e in ENDPOINT_CATALOG} | {"/.well-known/x402.json": "Agent discovery"},
         "payment": "x402 protocol — USDC on Base network",
+        "data_sources": ["SSB (data.ssb.no)", "Norges Bank (data.norges-bank.no)"],
     }
 
 
@@ -275,92 +330,58 @@ async def health():
 
 @app.get("/api-status")
 async def api_status():
-    """Free operational status endpoint. Extend with cache stats etc."""
     return {
-        "status": "ok",
-        "service": SERVICE_ID,
-        "version": "0.1.0",
+        "status": "ok", "service": SERVICE_ID, "version": "0.1.0",
         "uptime_seconds": int(time.time() - _PROCESS_START_TS),
+        "upstreams": ["data.ssb.no", "data.norges-bank.no"],
+        "cache": cache.stats(),
     }
+
+
+@app.get("/currencies")
+async def list_currencies():
+    return {"count": len(currencies.CURRENCIES), "currencies": currencies.CURRENCIES}
+
+
+@app.get("/municipalities")
+async def list_municipalities():
+    rows = municipalities.all_municipalities()
+    return {"count": len(rows), "municipalities": rows}
 
 
 @app.get("/services.json")
 async def services_manifest():
-    """Agentic Market / Bazaar service manifest for auto-discovery."""
     return {
-        "id": SERVICE_ID,
-        "name": SERVICE_NAME,
-        "description": SERVICE_DESCRIPTION,
-        "category": SERVICE_CATEGORY,
-        "x402Version": 2,
-        "networks": [EVM_NETWORK],
+        "id": SERVICE_ID, "name": SERVICE_NAME, "description": SERVICE_DESCRIPTION,
+        "category": SERVICE_CATEGORY, "x402Version": 2, "networks": [EVM_NETWORK],
         "website": SITE_URL,
-        "endpoints": [
-            {
-                "method": e["method"],
-                "path": e["path"],
-                "description": e["description"],
-                "price": e["price_usd"] or "$0.00",
-                "currency": "USDC",
-            }
-            for e in ENDPOINT_CATALOG
-        ],
+        "endpoints": [{"method": e["method"], "path": e["path"], "description": e["description"],
+                       "price": e["price_usd"] or "$0.00", "currency": "USDC"}
+                      for e in ENDPOINT_CATALOG],
     }
 
 
 @app.get("/.well-known/x402.json")
 async def x402_manifest():
-    """x402 agent-discovery manifest, generated from the endpoint catalog."""
     return {
         "x402Version": 2,
-        "service": {
-            "id": SERVICE_ID,
-            "name": SERVICE_NAME,
-            "description": SERVICE_DESCRIPTION,
-            "category": SERVICE_CATEGORY,
-            "website": SITE_URL,
-            "documentation": f"{SITE_URL}/llms.txt",
-            "servicesManifest": f"{SITE_URL}/services.json",
-        },
-        "payment": {
-            "schemes": ["exact"],
-            "networks": [EVM_NETWORK],
-            "asset": {
-                "symbol": "USDC",
-                "decimals": 6,
-                "address": USDC_BASE_MAINNET,
-                "chain": "Base",
-            },
-            "payTo": EVM_ADDRESS,
-            "facilitator": FACILITATOR_URL,
-        },
+        "service": {"id": SERVICE_ID, "name": SERVICE_NAME, "description": SERVICE_DESCRIPTION,
+                    "category": SERVICE_CATEGORY, "website": SITE_URL,
+                    "documentation": f"{SITE_URL}/llms.txt",
+                    "servicesManifest": f"{SITE_URL}/services.json"},
+        "payment": {"schemes": ["exact"], "networks": [EVM_NETWORK],
+                    "asset": {"symbol": "USDC", "decimals": 6, "address": USDC_BASE_MAINNET, "chain": "Base"},
+                    "payTo": EVM_ADDRESS, "facilitator": FACILITATOR_URL},
         "endpoints": [
-            {
-                "method": e["method"],
-                "path": e["path"],
-                "description": e["description"],
-                "accepts": [
-                    {
-                        "scheme": "exact",
-                        "network": EVM_NETWORK,
-                        "asset": "USDC",
-                        "amount": e["amount_atomic"],
-                        "amountDisplay": e["price_usd"],
-                        "payTo": EVM_ADDRESS,
-                    }
-                ] if e["amount_atomic"] else [],
-                "input": {
-                    "type": "http",
-                    "method": e["method"],
-                    **({"queryParams": e["query_params"]} if e["query_params"] else {}),
-                    **({"pathParams": e["path_params"]} if e["path_params"] else {}),
-                },
-                "output": (
-                    {"type": "json", "example": e["output_example"]}
-                    if e["output_example"] is not None
-                    else {"type": "json"}
-                ),
-            }
+            {"method": e["method"], "path": e["path"], "description": e["description"],
+             "accepts": [{"scheme": "exact", "network": EVM_NETWORK, "asset": "USDC",
+                          "amount": e["amount_atomic"], "amountDisplay": e["price_usd"], "payTo": EVM_ADDRESS}]
+                        if e["amount_atomic"] else [],
+             "input": {"type": "http", "method": e["method"],
+                       **({"queryParams": e["query_params"]} if e["query_params"] else {}),
+                       **({"pathParams": e["path_params"]} if e["path_params"] else {})},
+             "output": ({"type": "json", "example": e["output_example"]}
+                        if e["output_example"] is not None else {"type": "json"})}
             for e in ENDPOINT_CATALOG
         ],
     }
@@ -368,25 +389,24 @@ async def x402_manifest():
 
 @app.get("/llms.txt")
 async def llms_txt():
-    """LLMs.txt convention — agent-readable plain-text manifest."""
-    lines = [
-        f"# {SERVICE_NAME}",
-        f"> {SERVICE_DESCRIPTION}",
-        "",
-        "## Endpoints",
-    ]
+    lines = [f"# {SERVICE_NAME}", f"> {SERVICE_DESCRIPTION}", "", "## Endpoints"]
     for e in ENDPOINT_CATALOG:
         price = f"{e['price_usd']} USDC" if e["price_usd"] else "Free"
         lines.append(f"- {e['method']} {e['path']} — {price} — {e['description']}")
     lines += [
-        "",
-        "## Payment",
+        "", "## Payment",
         "- Protocol: x402 (HTTP 402 micropayments)",
         "- Currency: USDC on Base",
         "- No API keys or accounts needed",
         "- Agent discovery: GET /.well-known/x402.json",
-        "",
-        "## Links",
+        "", "## Source data",
+        "- SSB (Statistics Norway, data.ssb.no) — JSON-stat tables, free",
+        "- Norges Bank (data.norges-bank.no) — SDMX-JSON, free",
+        "- Cached: SSB 24h, exchange rates 1h, policy rate 6h",
+        "", "## Coverage",
+        "- ~50 Norwegian municipalities (see GET /municipalities)",
+        "- ~40 currencies (see GET /currencies)",
+        "", "## Links",
         f"- Website: {SITE_URL}",
         f"- Services manifest: {SITE_URL}/services.json",
         "",
@@ -397,38 +417,212 @@ async def llms_txt():
 @app.get("/robots.txt")
 async def robots_txt():
     return PlainTextResponse(
-        "User-agent: *\n"
-        "Allow: /\n"
-        "\n"
-        "# AI crawlers\n"
-        "User-agent: GPTBot\n"
-        "Allow: /\n"
-        "\n"
-        "User-agent: ClaudeBot\n"
-        "Allow: /\n"
-        "\n"
-        "User-agent: PerplexityBot\n"
-        "Allow: /\n"
-        "\n"
-        "User-agent: Google-Extended\n"
-        "Allow: /\n",
+        "User-agent: *\nAllow: /\n\n"
+        "User-agent: GPTBot\nAllow: /\n\n"
+        "User-agent: ClaudeBot\nAllow: /\n\n"
+        "User-agent: PerplexityBot\nAllow: /\n\n"
+        "User-agent: Google-Extended\nAllow: /\n",
         media_type="text/plain",
     )
 
 
-# ── Paid endpoints (REPLACE these with your agent's logic) ──────────
+def _set_cache_header(response: Response, hit: bool) -> None:
+    response.headers["X-Cache"] = "HIT" if hit else "MISS"
 
 
-@app.get("/example")
-async def example_endpoint(q: str = Query(..., min_length=1, max_length=200)):
-    """REPLACE: this is a paid endpoint. Add your business logic here.
+# ── Paid endpoints — Norges Bank ────────────────────────────────────
 
-    The x402 middleware has already verified payment by the time this
-    handler runs. Returning a non-error response triggers settlement;
-    raising HTTPException with status >= 400 cancels settlement (the
-    customer is not charged).
-    """
-    return {"q": q, "result": "replace me with real data"}
+
+@app.get("/exchange")
+async def exchange(
+    response: Response,
+    from_: str = Query(..., alias="from", min_length=3, max_length=3),
+    days: int = Query(30, ge=1, le=365),
+):
+    if not currencies.is_supported(from_):
+        raise HTTPException(400, f"Unsupported currency '{from_}'. See GET /currencies.")
+    if from_.upper() == "NOK":
+        raise HTTPException(400, "NOK is the quote currency — cannot quote NOK/NOK.")
+    try:
+        series, hit = await nb.exchange_rate(_http, from_, days=days, ttl=TTL_RATES)
+    except nb.NorgesBankError as e:
+        raise HTTPException(503, f"Norges Bank upstream: {e.message}")
+    if not series:
+        raise HTTPException(404, f"No exchange data for {from_.upper()}/NOK")
+    latest_date, latest_rate = series[-1]
+    _set_cache_header(response, hit)
+    return {"pair": f"{from_.upper()}/NOK", "rate": latest_rate, "date": latest_date,
+            "history": [{"date": d, "rate": r} for d, r in series[:-1]]}
+
+
+@app.get("/exchange/convert")
+async def exchange_convert(
+    response: Response,
+    amount: float = Query(..., gt=0),
+    from_: str = Query(..., alias="from", min_length=3, max_length=3),
+    to: str = Query(..., min_length=3, max_length=3),
+):
+    src = from_.upper()
+    dst = to.upper()
+    if not currencies.is_supported(src):
+        raise HTTPException(400, f"Unsupported currency '{src}'. See GET /currencies.")
+    if not currencies.is_supported(dst):
+        raise HTTPException(400, f"Unsupported currency '{dst}'. See GET /currencies.")
+    try:
+        rate_src_to_nok = 1.0
+        rate_dst_to_nok = 1.0
+        date = ""
+        hit = True
+        if src != "NOK":
+            s, h = await nb.exchange_rate(_http, src, days=1, ttl=TTL_RATES)
+            if not s:
+                raise HTTPException(404, f"No rate for {src}/NOK")
+            rate_src_to_nok = s[-1][1]
+            date = s[-1][0]
+            hit = hit and h
+        if dst != "NOK":
+            t, h = await nb.exchange_rate(_http, dst, days=1, ttl=TTL_RATES)
+            if not t:
+                raise HTTPException(404, f"No rate for {dst}/NOK")
+            rate_dst_to_nok = t[-1][1]
+            date = date or t[-1][0]
+            hit = hit and h
+    except nb.NorgesBankError as e:
+        raise HTTPException(503, f"Norges Bank upstream: {e.message}")
+    cross = rate_src_to_nok / rate_dst_to_nok
+    _set_cache_header(response, hit)
+    return {"amount": amount, "from": src, "to": dst,
+            "rate": round(cross, 6), "result": round(amount * cross, 4), "date": date}
+
+
+@app.get("/policy-rate")
+async def policy_rate(
+    response: Response,
+    days: int = Query(365, ge=1, le=1825),
+):
+    try:
+        series, hit = await nb.policy_rate(_http, days=days, ttl=TTL_POLICY)
+    except nb.NorgesBankError as e:
+        raise HTTPException(503, f"Norges Bank upstream: {e.message}")
+    if not series:
+        raise HTTPException(503, "No policy-rate data returned")
+    latest_date, latest_rate = series[-1]
+    _set_cache_header(response, hit)
+    return {"current_rate": latest_rate, "effective_date": latest_date,
+            "history": [{"date": d, "rate": r} for d, r in series]}
+
+
+# ── Paid endpoints — SSB ────────────────────────────────────────────
+
+
+@app.get("/population")
+async def population(
+    response: Response,
+    municipality: str = Query(..., min_length=1, max_length=64),
+):
+    resolved = municipalities.lookup(municipality)
+    if resolved is None:
+        raise HTTPException(404, f"Municipality '{municipality}' not found. See GET /municipalities.")
+    name, code, county = resolved
+    body = ssb.build_query({"Region": [code], "Tid": ["*"]})
+    try:
+        data, hit = await ssb.query(_http, ssb.TABLE_POPULATION, body, ttl=TTL_SSB)
+    except ssb.SSBError as e:
+        raise HTTPException(503, f"SSB upstream: {e.message}")
+    rows = jsonstat.time_series(data, time_dim="Tid")
+    if not rows:
+        raise HTTPException(404, f"No population data for {name}")
+    latest = rows[-6:]
+    last = latest[-1]
+    _set_cache_header(response, hit)
+    return {"municipality": name.title(), "code": code, "county": county,
+            "population": last["value"], "year": last["time"],
+            "history": [{"year": r["time"], "population": r["value"]} for r in latest[:-1]]}
+
+
+@app.get("/cpi")
+async def cpi(
+    response: Response,
+    months: int = Query(12, ge=1, le=120),
+):
+    body = ssb.build_query({"Tid": ["*"]})
+    try:
+        data, hit = await ssb.query(_http, ssb.TABLE_CPI, body, ttl=TTL_SSB)
+    except ssb.SSBError as e:
+        raise HTTPException(503, f"SSB upstream: {e.message}")
+    rows = jsonstat.time_series(data, time_dim="Tid")
+    if not rows:
+        raise HTTPException(503, "No CPI data returned")
+    series = rows[-months:]
+    last = series[-1]
+    yoy = ssb.yoy_change_pct(rows)
+    _set_cache_header(response, hit)
+    return {"current_index": last["value"], "month": last["time"],
+            "inflation_yoy_pct": yoy,
+            "monthly": [{"month": r["time"], "index": r["value"]} for r in series]}
+
+
+@app.get("/housing")
+async def housing(
+    response: Response,
+    quarters: int = Query(8, ge=1, le=40),
+):
+    body = ssb.build_query({"Tid": ["*"]})
+    try:
+        data, hit = await ssb.query(_http, ssb.TABLE_HOUSING, body, ttl=TTL_SSB)
+    except ssb.SSBError as e:
+        raise HTTPException(503, f"SSB upstream: {e.message}")
+    rows = jsonstat.time_series(data, time_dim="Tid")
+    if not rows:
+        raise HTTPException(503, "No housing data returned")
+    series = rows[-quarters:]
+    last = series[-1]
+    yoy = ssb.yoy_change_pct(rows)
+    _set_cache_header(response, hit)
+    return {"region": "Hele landet", "price_index": last["value"], "quarter": last["time"],
+            "change_yoy_pct": yoy,
+            "quarterly": [{"quarter": r["time"], "index": r["value"]} for r in series]}
+
+
+@app.get("/unemployment")
+async def unemployment(
+    response: Response,
+    months: int = Query(12, ge=1, le=60),
+):
+    body = ssb.build_query({"Tid": ["*"]})
+    try:
+        data, hit = await ssb.query(_http, ssb.TABLE_UNEMPLOYMENT, body, ttl=TTL_SSB)
+    except ssb.SSBError as e:
+        raise HTTPException(503, f"SSB upstream: {e.message}")
+    rows = jsonstat.time_series(data, time_dim="Tid")
+    if not rows:
+        raise HTTPException(503, "No unemployment data returned")
+    series = rows[-months:]
+    last = series[-1]
+    _set_cache_header(response, hit)
+    return {"region": "Hele landet", "rate_pct": last["value"], "month": last["time"],
+            "monthly": [{"month": r["time"], "rate_pct": r["value"]} for r in series]}
+
+
+@app.get("/gdp")
+async def gdp(
+    response: Response,
+    quarters: int = Query(8, ge=1, le=40),
+):
+    body = ssb.build_query({"Tid": ["*"]})
+    try:
+        data, hit = await ssb.query(_http, ssb.TABLE_GDP, body, ttl=TTL_SSB)
+    except ssb.SSBError as e:
+        raise HTTPException(503, f"SSB upstream: {e.message}")
+    rows = jsonstat.time_series(data, time_dim="Tid")
+    if not rows:
+        raise HTTPException(503, "No GDP data returned")
+    series = rows[-quarters:]
+    last = series[-1]
+    yoy = ssb.yoy_change_pct(rows)
+    _set_cache_header(response, hit)
+    return {"gdp_value": last["value"], "quarter": last["time"], "growth_yoy_pct": yoy,
+            "quarterly": [{"quarter": r["time"], "value": r["value"]} for r in series]}
 
 
 # ── Static files ────────────────────────────────────────────────────
